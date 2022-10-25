@@ -15,9 +15,8 @@
 //!   .bind("[::1]:8080");
 //! ```
 use crate::field_names::FieldNames;
-use actix_web::dev::{
-    BodySize, MessageBody, ResponseBody, Service, ServiceRequest, ServiceResponse, Transform,
-};
+use actix_web::body::{BodySize, MessageBody};
+use actix_web::dev::{Service, ServiceRequest, ServiceResponse, Transform};
 use actix_web::error::{Error, Result};
 use actix_web::http::header::{HOST, REFERER, USER_AGENT};
 use actix_web::http::StatusCode;
@@ -67,12 +66,11 @@ impl StructuredLogger {
 }
 
 /// "initializer" for the service/the actual middleware (called once per worker)
-impl<S, B> Transform<S> for StructuredLogger
+impl<S, B> Transform<S, ServiceRequest> for StructuredLogger
 where
-    S: Service<Request = ServiceRequest, Response = ServiceResponse<B>, Error = Error>,
+    S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error>,
     B: MessageBody,
 {
-    type Request = ServiceRequest;
     type Response = ServiceResponse<StreamLog<B>>;
     type Error = Error;
     type Transform = StructuredLoggerMiddleware<S>;
@@ -95,21 +93,20 @@ pub struct StructuredLoggerMiddleware<S> {
     service: S,
 }
 
-impl<S, B> Service for StructuredLoggerMiddleware<S>
+impl<S, B> Service<ServiceRequest> for StructuredLoggerMiddleware<S>
 where
-    S: Service<Request = ServiceRequest, Response = ServiceResponse<B>, Error = Error>,
+    S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error>,
     B: MessageBody,
 {
-    type Request = ServiceRequest;
     type Response = ServiceResponse<StreamLog<B>>;
     type Error = Error;
     type Future = LoggerResponse<S, B>;
 
-    fn poll_ready(&mut self, cx: &mut Context) -> Poll<Result<(), Self::Error>> {
+    fn poll_ready(&self, cx: &mut Context) -> Poll<Result<(), Self::Error>> {
         self.service.poll_ready(cx)
     }
 
-    fn call(&mut self, req: ServiceRequest) -> Self::Future {
+    fn call(&self, req: ServiceRequest) -> Self::Future {
         // check the exclude-list if to skip this path…
         let is_exclude = self.inner.exclude.contains(req.path());
 
@@ -130,7 +127,7 @@ where
 
         let remote_addr = req
             .connection_info()
-            .remote_addr()
+            .peer_addr()
             .map_or(String::from("-"), ToOwned::to_owned);
 
         let host = req
@@ -179,7 +176,7 @@ where
 pub struct LoggerResponse<S, B>
 where
     B: MessageBody,
-    S: Service,
+    S: Service<ServiceRequest>,
 {
     #[pin]
     fut: S::Future,
@@ -196,11 +193,11 @@ where
 impl<S, B> Future for LoggerResponse<S, B>
 where
     B: MessageBody,
-    S: Service<Request = ServiceRequest, Response = ServiceResponse<B>, Error = Error>,
+    S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error>,
 {
     type Output = Result<ServiceResponse<StreamLog<B>>, Error>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.project();
 
         let res = match futures::ready!(this.fut.poll(cx)) {
@@ -218,14 +215,12 @@ where
         let logger = this.logger.new(o!("status" => res.status().as_u16()));
         let is_exclude: bool = *this.is_exclude;
 
-        Poll::Ready(Ok(res.map_body(move |_, body| {
-            ResponseBody::Body(StreamLog {
-                logger,
-                is_exclude,
-                body,
-                timestamp,
-                size: 0,
-            })
+        Poll::Ready(Ok(res.map_body(move |_, body| StreamLog {
+            logger,
+            is_exclude,
+            body,
+            timestamp,
+            size: 0,
         })))
     }
 }
@@ -235,7 +230,7 @@ pub struct StreamLog<B> {
     logger: Logger,
     is_exclude: bool,
     #[pin]
-    body: ResponseBody<B>,
+    body: B,
     size: usize,
     timestamp: DateTime<Utc>,
 }
@@ -252,11 +247,17 @@ impl<B> PinnedDrop for StreamLog<B> {
 }
 
 impl<B: MessageBody> MessageBody for StreamLog<B> {
+    type Error = B::Error;
+
+    #[inline]
     fn size(&self) -> BodySize {
         self.body.size()
     }
 
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Result<Bytes, Error>>> {
+    fn poll_next(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Bytes, Self::Error>>> {
         let this = self.project();
         match this.body.poll_next(cx) {
             Poll::Ready(Some(Ok(chunk))) => {
